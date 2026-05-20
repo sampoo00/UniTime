@@ -98,11 +98,13 @@ python eval_metrics.py --res ./results/RUN_NAME/results.json
 ## Citation
 If you use this code and data for your research or project, please cite:
 
-	@inproceedings{unitime2025,
-	    title={Universal Video Temporal Grounding with Generative Multi-modal Large Language Models},
-	    author={Li, Zeqian and Di, Shangzhe and Zhai, Zhonghua and Huang, Weilin and Wang, Yanfeng and Xie, Weidi},
-	    booktitle={NeurIPS},
-	    year={2025}
+	@article{li2026universal,
+	  title={Universal video temporal grounding with generative multi-modal large language models},
+	  author={Li, Zeqian and Di, Shangzhe and Zhai, Zhonghua and Huang, Weilin and Wang, Yanfeng and Xie, Weidi},
+	  journal={Advances in Neural Information Processing Systems},
+	  volume={38},
+	  pages={64426--64455},
+	  year={2026}
 	}
 
 ## Acknowledgements
