@@ -20,7 +20,7 @@ class Qwen2VLMRForConditionalGeneration(Qwen2VLForConditionalGeneration):
         super().__init__(config)
 
         self.visual = Qwen2VisionTransformerPretrainedModel._from_config(
-            config.vision_config, attn_implementation="flash_attention_2"
+            config.vision_config, attn_implementation="sdpa" #attn_implementation="flash_attention_2" djkim
         )
         self.model = Qwen2VLModel(config)
         self.vocab_size = config.vocab_size

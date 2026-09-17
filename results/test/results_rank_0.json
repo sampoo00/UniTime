@@ -1,0 +1,27 @@
+[
+    {
+        "qid": 0,
+        "id": "3MSZA",
+        "annos": [
+            {
+                "query": "person turn a light on.",
+                "window": [
+                    [
+                        24.3,
+                        30.4
+                    ]
+                ]
+            }
+        ],
+        "duration": 30.96,
+        "video_path": "./videos/3MSZA.mp4",
+        "feature_path": null,
+        "pred_relevant_windows": [
+            [
+                22.4,
+                30.9
+            ]
+        ],
+        "pred_relevant_windows_mr_seg": null
+    }
+]
