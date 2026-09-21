@@ -297,9 +297,28 @@ def inference_worker(rank, world_size, args):
     # Run inference
     all_results = []
     for data in tqdm(dataloader, desc=f"Processing (rank {rank})", disable=rank != 0):
-        # print(data)
-        # data = data[0]  # Since batch_size=1
+        # Print data information before processing
+        print(f"\n=== Processing video: {data.get('id', 'N/A')} ===")
+        print(f"QID: {data.get('qid', 'N/A')}")
+        print(f"Video ID: {data.get('id', 'N/A')}")
+        print(f"Duration: {data.get('duration', 'N/A')}")
+        print(f"Video path: {data.get('video_path', 'N/A')}")
+        print(f"Feature path: {data.get('feature_path', 'N/A')}")
+        print(f"Video start: {data.get('video_start', 0)}")
+        print(f"Video end: {data.get('video_end', data.get('duration', 0))}")
+        print(f"Retrieval mode: {data.get('retrieval_mode', 'N/A')}")
+        if 'annos' in data:
+            print(f"Number of annotations: {len(data['annos'])}")
+            for i, anno in enumerate(data['annos'][:3]):  # Show first 3 annotations
+                print(f"  Annotation {i}: Query='{anno.get('query', '')[:50]}...'")
+        print(f"=== End of data info ===\n")
+        
+        # Measure execution time
+        start_time = time.time()
         results = run_inference(model, processor, data, args, device)
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Execution time for video {data['id']}: {execution_time:.2f} seconds")
         all_results.extend(results)
     
     # Save results from each process
