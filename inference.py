@@ -95,6 +95,82 @@ def construct_messages_mr_fps(video_path, feature_path, fps, retrieval_segment, 
         ]
     return message
 
+# ---------------------------------------------------------------------------
+# [Timing utilities]
+# run_inference 의 실행 시간을 함수 외부에서 측정하기 위한 헬퍼.
+# GPU 연산은 비동기이므로 종료 시점에 torch.cuda.synchronize() 를 호출해야
+# 실제 GPU 수행 시간이 정확히 반영된다.
+# ---------------------------------------------------------------------------
+
+INFERENCE_TIME_STATS = []
+
+
+def timed_run_inference(model, processor, data, args, device):
+    """run_inference 를 감싸 실행 시간을 측정한다.
+
+    Args:
+        model, processor, data, args, device: run_inference 와 동일한 인자.
+
+    Returns:
+        tuple: (results, elapsed_sec)
+            results     : run_inference 의 원본 반환값
+            elapsed_sec : 부동소수점, 전체 실행 시간(초)
+    """
+    # GPU 워밍업/비동기 연산이 남아있을 수 있으므로 이전 연산부터 확정
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    start = time.perf_counter()
+    results = run_inference(model, processor, data, args, device)
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    elapsed = time.perf_counter() - start
+
+    vid = data.get("id", "N/A")
+    mode = data.get("retrieval_mode", data.get("mode", "N/A"))
+    INFERENCE_TIME_STATS.append(
+        {"id": vid, "qid": data.get("qid", "N/A"), "mode": mode, "elapsed": elapsed}
+    )
+    print(f"Execution time for video {vid} (mode={mode}): {elapsed:.2f} seconds")
+
+    return results, elapsed
+
+
+def print_inference_time_stats():
+    """수집된 실행 시간 통계를 요약해 출력한다."""
+    if not INFERENCE_TIME_STATS:
+        print("[timing] no inference records collected.")
+        return {}
+
+    times = [r["elapsed"] for r in INFERENCE_TIME_STATS]
+    stats = {
+        "count": len(times),
+        "total": sum(times),
+        "mean": sum(times) / len(times),
+        "min": min(times),
+        "max": max(times),
+    }
+    stats["median"] = float(np.median(times))
+
+    print("\n" + "=" * 60)
+    print("[timing] run_inference summary")
+    print("=" * 60)
+    print(f"  count   : {stats['count']}")
+    print(f"  total   : {stats['total']:.2f} s")
+    print(f"  mean    : {stats['mean']:.2f} s")
+    print(f"  median  : {stats['median']:.2f} s")
+    print(f"  min     : {stats['min']:.2f} s")
+    print(f"  max     : {stats['max']:.2f} s")
+    print("=" * 60 + "\n")
+    return stats
+
+
+def reset_inference_time_stats():
+    """수집된 통계를 초기화한다."""
+    INFERENCE_TIME_STATS.clear()
+
+
 def run_inference(model, processor, data, args, device):
     qid = data["qid"]
     vid = data["id"]
@@ -313,12 +389,8 @@ def inference_worker(rank, world_size, args):
                 print(f"  Annotation {i}: Query='{anno.get('query', '')[:50]}...'")
         print(f"=== End of data info ===\n")
         
-        # Measure execution time
-        start_time = time.time()
-        results = run_inference(model, processor, data, args, device)
-        end_time = time.time()
-        execution_time = end_time - start_time
-        print(f"Execution time for video {data['id']}: {execution_time:.2f} seconds")
+        # Measure execution time (외부 래퍼로 측정: run_inference 내부 로직은 그대로 유지)
+        results, execution_time = timed_run_inference(model, processor, data, args, device)
         all_results.extend(results)
     
     # Save results from each process
@@ -326,11 +398,18 @@ def inference_worker(rank, world_size, args):
     output_file = os.path.join(args.output_dir, f"results_rank_{rank}.json")
     with open(output_file, 'w') as f:
         json.dump(all_results, f, indent=4)
-    
+
+    # Save timing stats of each process
+    timing_file = os.path.join(args.output_dir, f"timing_rank_{rank}.json")
+    with open(timing_file, 'w') as f:
+        json.dump(INFERENCE_TIME_STATS, f, indent=4)
+    print_inference_time_stats()
+
     cleanup()
 
 def merge_results(output_dir, world_size):
     final_results = []
+    all_timings = []
     for rank in range(world_size):
         result_file = os.path.join(output_dir, f"results_rank_{rank}.json")
         if os.path.exists(result_file):
@@ -338,11 +417,35 @@ def merge_results(output_dir, world_size):
                 results = json.load(f)
                 final_results.extend(results)
             os.remove(result_file)  # Clean up temporary files
-    
+
+        timing_file = os.path.join(output_dir, f"timing_rank_{rank}.json")
+        if os.path.exists(timing_file):
+            with open(timing_file, 'r') as f:
+                all_timings.extend(json.load(f))
+            os.remove(timing_file)  # Clean up temporary files
+
     # Save final merged results
     final_output_file = os.path.join(output_dir, "results.json")
     with open(final_output_file, 'w') as f:
         json.dump(final_results, f, indent=4)
+
+    # Save merged timing stats
+    if all_timings:
+        final_timing_file = os.path.join(output_dir, "timing.json")
+        with open(final_timing_file, 'w') as f:
+            json.dump(all_timings, f, indent=4)
+
+        times = [t["elapsed"] for t in all_timings]
+        print("\n" + "=" * 60)
+        print("[timing] run_inference summary (all ranks merged)")
+        print("=" * 60)
+        print(f"  count   : {len(times)}")
+        print(f"  total   : {sum(times):.2f} s")
+        print(f"  mean    : {sum(times) / len(times):.2f} s")
+        print(f"  median  : {float(np.median(times)):.2f} s")
+        print(f"  min     : {min(times):.2f} s")
+        print(f"  max     : {max(times):.2f} s")
+        print("=" * 60 + "\n")
 
 def main():
     parser = argparse.ArgumentParser(description='Run Qwen2-VL inference on Temporal Grounding')
