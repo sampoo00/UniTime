@@ -172,6 +172,18 @@ def reset_inference_time_stats():
 
 
 def run_inference(model, processor, data, args, device):
+    """
+    단일 비디오 샘플 및 관련 쿼리에 대해 모델 추론을 수행한다.
+    
+    UniTime의 핵심 전략인 Coarse-to-Fine 2단계 추론 구조를 지원:
+      - 1단계 (mr_seg): 긴 영상인 경우, 전체 영상에서 쿼리와 관련된 대략적인 후보 세그먼트(구간)를 탐색.
+      - 2단계 (mr): 짧은 영상이거나 1단계에서 좁혀진 구간 내에서 정확한 시작/종료 시점(temporal window)을 예측.
+      - mr_seg 단계가 완료되면 검색 구간(video_start, video_end)을 좁히고 모드를 'mr'로 변경하여
+        동일 함수를 재귀 호출(recursive call)함.
+    """
+    # -------------------------------------------------------------------------
+    # 1. 메타데이터 파싱 및 검색 구간(retrieval segment) 설정
+    # -------------------------------------------------------------------------
     qid = data["qid"]
     vid = data["id"]
     annos = data["annos"]
@@ -183,6 +195,12 @@ def run_inference(model, processor, data, args, device):
 
     retrieval_segment = [video_start, video_end]
     # print(retrieval_segment)
+
+    # -------------------------------------------------------------------------
+    # 2. 추론 모드 결정 (mr vs mr_seg)
+    #    - 영상 길이가 nf_short 이하이거나 이미 mr이면 -> 정밀 검색('mr')
+    #    - 긴 영상이면 -> 1단계 거친 세그먼트 탐색('mr_seg')
+    # -------------------------------------------------------------------------
     retrieval_mode = data.get("retrieval_mode", None)
     if args.nf_short != -1:
         if (video_end - video_start <= args.nf_short) or retrieval_mode == "mr":
@@ -192,6 +210,10 @@ def run_inference(model, processor, data, args, device):
     elif retrieval_mode == None:
         retrieval_mode = data.get("mode", None)
 
+    # -------------------------------------------------------------------------
+    # 3. 비디오 파일 경로 및 사전 추출 피처(Feature) 경로 확인
+    #    - mr_seg 모드이고 피처가 없으면 feature() 함수로 사전 추출 수행
+    # -------------------------------------------------------------------------
     video_path = data.get("video_path", None)
     feature_path = data.get("feature_path", None)
 
@@ -205,13 +227,18 @@ def run_inference(model, processor, data, args, device):
     if feature_path is None and retrieval_mode == 'mr_seg':
         feature_path = feature(model, processor, video_path, feature_root=args.feat_folder)
 
+    # -------------------------------------------------------------------------
+    # 4. 비전 프롬프트 메시지 구성 및 비디오/피처 전처리
+    # -------------------------------------------------------------------------
     message = construct_messages_mr_fps(
         video_path, feature_path, args.fps, retrieval_segment, retrieval_mode, args.clip_length
     )
     messages = [message]
 
+    # 비디오 프레임 추출 및 타임스탬프 정보 전처리
     image_inputs, video_inputs, all_timestamps_combine, feature_inputs, combine_t_list = process_vision_info(messages)
 
+    # 프레임/클립별 인터리빙 타임스탬프 텍스트 포맷팅 ("timestamp: X.X seconds; feature: ")
     if feature_inputs is None:
         all_timestamps_num = [[round((x + y)/2, 1) for x, y in zip(sublist[::2], sublist[1::2])] for sublist in all_timestamps_combine]
     else:
@@ -219,7 +246,11 @@ def run_inference(model, processor, data, args, device):
     all_timestamps = [[f"timestamp: {all_t} seconds; feature: " for all_t in sublist] for sublist in all_timestamps_num]
 
     results = []
+    # -------------------------------------------------------------------------
+    # 5. 각 쿼리별 반복 추론 수행
+    # -------------------------------------------------------------------------
     for query, temporal_window in zip(querys, temporal_windows):
+        # 5-1. 사용자 질문(Query) 추가 및 Chat Template 적용
         message_for_query = message.copy()
         message_for_query.append(
             {
@@ -232,6 +263,8 @@ def run_inference(model, processor, data, args, device):
         text = processor.apply_chat_template(
             message_for_query, tokenize=False, add_generation_prompt=False
         )
+
+        # 5-2. 텍스트 + 비전 데이터를 토큰화 및 텐서 변환
         inputs = processor(
             text=[text],
             images=image_inputs,
@@ -244,6 +277,7 @@ def run_inference(model, processor, data, args, device):
         )
         inputs = inputs.to(device)
 
+        # 5-3. 피처 및 모델 입력 텐서 정렬
         if feature_inputs is not None:
             feature_inputs = torch.cat(
                 [feature_inputs[i].reshape(-1, feature_inputs[i].shape[3]) for i in range(len(feature_inputs))],
@@ -269,6 +303,7 @@ def run_inference(model, processor, data, args, device):
                 combine_t_list=combine_t_list
             )
         
+        # 5-4. 모델 생성(Generation) 수행 (Greedy Decoding)
         gen_kwargs = {'max_new_tokens': 128, 'temperature': 0.0, 'top_p': 1.0, 'num_beams': 1, 'do_sample': False}
         generated_ids = model.generate(
             **model_inputs,
@@ -282,6 +317,7 @@ def run_inference(model, processor, data, args, device):
             use_cache=True,
         )
 
+        # 5-5. 출력 디코딩 및 시간 정보 추출
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
@@ -290,7 +326,12 @@ def run_inference(model, processor, data, args, device):
         )
         # import ipdb;ipdb.set_trace()
         predictions = extract_time(output_text).numpy()
+
+        # ---------------------------------------------------------------------
+        # 6. 결과 처리 및 모드별 후처리 / 재귀 호출
+        # ---------------------------------------------------------------------
         if retrieval_mode =='mr':
+            # [Case A: mr 모드] 정밀 구간 [start, end] 예측 결과를 결과 리스트에 저장
             data_dict = {
                 "qid": qid,
                 "id": vid,
@@ -308,12 +349,14 @@ def run_inference(model, processor, data, args, device):
             }
             results.append(data_dict)
         else:
+            # [Case B: mr_seg 모드] 1단계 대략적인 세그먼트 탐색 결과 바탕으로 검색 구간 축소
             pred_relevant_windows_mr_seg = data.get("pred_relevant_windows_mr_seg", None)
             if pred_relevant_windows_mr_seg is None:
                 pred_relevant_windows_mr_seg = []
             pred_relevant_windows_mr_seg.append(to_window_list_pred_vr(predictions[0]))
             data["pred_relevant_windows_mr_seg"] = pred_relevant_windows_mr_seg
 
+            # 예측된 타임스탬프로 2단계 검색 시작/종료 시점 갱신
             sampled_timestamps = all_timestamps_num[0]
             predictions_seg = to_window_list_pred_vr(predictions[0])
             video_start = predictions_seg[0]
@@ -331,6 +374,7 @@ def run_inference(model, processor, data, args, device):
             video_end = min(video_end, duration)
             video_start = max(0, video_start)
 
+            # 좁혀진 구간을 바탕으로 'mr' 모드로 2단계 정밀 추론 재귀 실행
             data["video_start"] = video_start
             data["video_end"] = video_end
             data["retrieval_mode"] = "mr"
